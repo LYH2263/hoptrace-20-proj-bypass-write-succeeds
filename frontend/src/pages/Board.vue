@@ -82,9 +82,15 @@ async function tryDirectWrite() {
     await api.writeStatusDirect(selected.value, hopCode.value === 'DELIVERED' ? '已签收' : '运输中')
     actionErr.value = '意外：直接改写未被拒绝'
   } catch (e) {
-    actionErr.value = `已拒绝并回滚：${e.message}`
+    // 失败响应可区分：409 + DIRECT_STATUS_WRITE_REJECTED，且整笔回滚无半成功。
+    const code = e.payload?.detail?.error
+    actionErr.value = code
+      ? `已拒绝并回滚（${code}）：${e.message}`
+      : `已拒绝并回滚：${e.message}`
   } finally {
     busy.value = false
+    await loadDetail(selected.value)
+    await loadList()
   }
 }
 </script>
@@ -100,10 +106,13 @@ async function tryDirectWrite() {
       <div class="stat"><b>{{ overview.hops_sidecar }}</b><span>旁路</span></div>
       <div class="stat"><b>{{ overview.quarantine }}</b><span>隔离</span></div>
       <div class="stat" :class="{ ok: !overview.projection_diverged, bad: overview.projection_diverged }">
-        <b>{{ overview.projection_aligned }}</b><span>投影汇总</span>
+        <b>{{ overview.projection_aligned }}</b><span>投影同源</span>
       </div>
       <div class="stat" :class="{ bad: overview.projection_diverged }">
         <b>{{ overview.projection_diverged }}</b><span>投影分叉</span>
+      </div>
+      <div class="stat" :class="{ bad: overview.bypass_rejections }">
+        <b>{{ overview.bypass_rejections }}</b><span>旁路拒绝</span>
       </div>
     </div>
 
@@ -143,10 +152,12 @@ async function tryDirectWrite() {
         <dl class="kv" v-if="detail?.waybill">
           <dt>运单</dt><dd>{{ detail.waybill.id }}</dd>
           <dt>投影状态</dt><dd>{{ detail.waybill.status_proj }}</dd>
-          <dt>汇总</dt>
+          <dt>末 hop 映射</dt>
+          <dd>{{ check?.mapped_code || '—' }} → {{ check?.expected_status || '—' }}</dd>
+          <dt>同源</dt>
           <dd>
-            <span v-if="check" class="tag" :class="check['汇总'] ? 'ok' : 'bad'">
-              {{ check['汇总'] ? '是' : '否' }}
+            <span v-if="check" class="tag" :class="check['同源'] ? 'ok' : 'bad'">
+              {{ check['同源'] ? '是' : '否' }}
             </span>
           </dd>
           <dt>创建</dt><dd>{{ detail.waybill.created_at }}</dd>
@@ -161,6 +172,11 @@ async function tryDirectWrite() {
           <dt>证明时刻</dt><dd>{{ proof.created_at }}</dd>
         </dl>
         <p v-else class="muted">暂无证明</p>
+        <p class="hint">
+          <router-link :to="`/attestations?wb=${selected}`" class="inline-link">
+            查看该运单的投影同源核证 →
+          </router-link>
+        </p>
 
         <h2>装载 hop</h2>
         <div class="control">
@@ -169,7 +185,7 @@ async function tryDirectWrite() {
           </select>
           <button class="btn small" :disabled="busy" @click="loadHop">装载并重算</button>
         </div>
-        <p class="hint">投影随正式线末有效 hop 装载后更新；乱序旧 hop 不改变投影。</p>
+        <p class="hint">正式线成功变更即在同一事务重算投影并写证明/核证；乱序旧 hop 不改变末有效 hop。</p>
 
         <h2>直接改投影</h2>
         <div class="control">
@@ -177,12 +193,12 @@ async function tryDirectWrite() {
             尝试直接改写（应失败）
           </button>
         </div>
-        <p class="hint">该入口整笔失败并回滚，不留下半成功。</p>
+        <p class="hint">该入口整笔失败并回滚，不留下半成功；拒绝会落一条旁路核证。</p>
 
         <p v-if="actionMsg" class="flash ok">{{ actionMsg }}</p>
         <p v-if="actionErr" class="flash bad">{{ actionErr }}</p>
 
-        <p class="hint" v-if="check && !check['汇总']">
+        <p class="hint" v-if="check && !check['同源']">
           分叉原因：{{ check.divergences.join('；') }}
         </p>
       </aside>

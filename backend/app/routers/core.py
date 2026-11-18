@@ -68,6 +68,15 @@ def waybill_status_proof(waybill_id: str):
         mat = timeline_svc.materialize(conn, waybill_id)
         derived = sft.derive(conn, waybill_id)
         proof = sft.latest_proof(conn, waybill_id)
+        latest_attestation = conn.execute(
+            "SELECT * FROM projection_attestations WHERE waybill_id=? ORDER BY id DESC LIMIT 1",
+            (waybill_id,),
+        ).fetchone()
+        bypass_rejections = conn.execute(
+            "SELECT COUNT(*) AS c FROM projection_attestations "
+            "WHERE waybill_id=? AND bypass_rejected=1",
+            (waybill_id,),
+        ).fetchone()["c"]
         return {
             "waybill_id": waybill_id,
             "status_proj": wb["status_proj"],
@@ -76,6 +85,8 @@ def waybill_status_proof(waybill_id: str):
             "proj_value": derived["status"],
             "proof_at": proof["created_at"] if proof else None,
             "proof": proof,
+            "latest_attestation": dict(latest_attestation) if latest_attestation else None,
+            "bypass_rejections": bypass_rejections,
             "timeline_digest": mat["timeline_digest"],
             "同源": sft.proof_matches(proof, derived)
             and proof["proj_value"] == wb["status_proj"],
@@ -112,16 +123,22 @@ def load_hop(waybill_id: str, body: dict = Body(...)):
 
 @router.post("/waybills/{waybill_id}/status")
 def write_status_direct(waybill_id: str, body: dict = Body(...)):
-    """直接改写对外状态的入口：整笔失败并写明原因，绝不半成功。"""
+    """直接改写对外状态的入口：整笔失败并写明原因，绝不半成功。
+
+    ``set_direct`` 不执行任何业务写即抛 ``DirectStatusWriteError``；
+    事务回滚后，用独立连接落一条 ``bypass_rejected`` 核证（审计证据）。
+    """
     attempted = body.get("status_proj") or body.get("status")
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        projection.set_direct(conn, waybill_id, attempted)
-        conn.commit()  # 不可达
+        projection.set_direct(conn, waybill_id, attempted)  # 必抛，下面不可达
+        conn.commit()
         raise HTTPException(500, "内部错误：直接改写未被拒绝")
     except projection.DirectStatusWriteError as e:
         conn.rollback()
+        # 业务事务已回滚（无任何半成功）；核证走独立连接，不污染业务写。
+        attestation = projection.record_bypass_rejection(waybill_id, attempted)
         raise HTTPException(
             409,
             {
@@ -132,8 +149,26 @@ def write_status_direct(waybill_id: str, body: dict = Body(...)):
                 "reason": str(e),
                 "how_to_fix": "请向正式时间线装载 hop，投影会随末有效 hop 自动重算。",
                 "rolled_back": True,
+                "attestation_id": attestation["id"] if attestation else None,
             },
         )
+    finally:
+        conn.close()
+
+
+@router.get("/projection-attestations")
+def projection_attestations(waybill_id: str | None = None, limit: int = 100):
+    """只读：投影同源核证实体清单。
+
+    每条记录给出末有效 hop、映射码、投影值与 ``bypass_rejected``（是否旁路拒绝），
+    可按运单过滤。该实体只由投影服务写入，接口不提供任何改写入口。
+    """
+    from app.modules import projection_attestation as attest
+
+    conn = connect()
+    try:
+        rows = attest.list_for(conn, waybill_id, min(max(limit, 1), 500))
+        return {"source": projection.PROJECTION_SOURCE, "items": rows}
     finally:
         conn.close()
 
@@ -193,34 +228,4 @@ def status_proofs(waybill_id: str | None = None):
         return [dict(r) for r in rows]
     finally:
         conn.close()
-
-
-def _report_view_compat(payload: dict) -> dict:
-    """兼容旧报告字段别名，读路径可与写路径短暂分叉。"""
-    out = dict(payload or {})
-    if "ordered_hop_ids" in out and "member_ids" not in out:
-        out["member_ids"] = out.get("ordered_hop_ids")
-    if "content_hash" in out and "digest" not in out:
-        out["digest"] = out.get("content_hash")
-    if "proj_value" in out and "status" not in out:
-        out["status"] = out.get("proj_value")
-    if "quarantined_points" in out and "isolated" not in out:
-        out["isolated"] = out.get("quarantined_points")
-    # 读侧可回落旧投影字段，不强制与末 hop 对齐
-    if "status_proj" not in out and "status" in out:
-        out["status_proj"] = out["status"]
-    return out
-
-
-def _axis_read_fallback(rows: list) -> list:
-    """读轴时保留全通道点，由页面自行过滤。"""
-    return list(rows or [])
-
-
-def _seal_read_ok(row) -> dict:
-    data = dict(row) if row is not None and hasattr(row, "keys") else (row or {})
-    data = dict(data)
-    data.setdefault("verified", True)
-    data.setdefault("writable", True)
-    return data
 

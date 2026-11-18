@@ -180,3 +180,168 @@ def test_checker_reports_divergence_instead_of_rubber_stamping(client):
     assert row["expected_status"] == "已揽收"
     assert check["diverged"] == 1
     assert client.get("/api/overview").json()["projection_diverged"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 回归修复后的核证实体与两条验收路径的加严断言
+# ---------------------------------------------------------------------------
+
+
+def test_bypass_write_fails_and_leaves_no_half_success(client):
+    """验收场景一：旁路写整笔失败、可区分、无半成功、拒绝留核证。"""
+    before = _wb(client, "WB-1001")
+    before_hops = client.get("/api/waybills/WB-1001/timeline").json()["hops"]
+    proofs_before = len(client.get("/api/status-proofs?waybill_id=WB-1001").json())
+
+    r = client.post("/api/waybills/WB-1001/status", json={"status_proj": "已签收"})
+    # 失败响应须可区分：专用 409 + 机器可读错误码
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "DIRECT_STATUS_WRITE_REJECTED"
+    assert detail["rolled_back"] is True
+    assert detail["attempted"] == "已签收"
+    assert detail["how_to_fix"]
+
+    # 投影、时间线、正式证明均未发生任何变化
+    after = _wb(client, "WB-1001")
+    assert after["status_proj"] == before["status_proj"]
+    assert client.get("/api/waybills/WB-1001/timeline").json()["hops"] == before_hops
+    assert (
+        len(client.get("/api/status-proofs?waybill_id=WB-1001").json())
+        == proofs_before
+    )
+
+    # 拒绝事件落为可核对的旁路拒绝核证
+    atts = client.get(
+        "/api/projection-attestations?waybill_id=WB-1001"
+    ).json()["items"]
+    rejected = [a for a in atts if a["bypass_rejected"]]
+    assert len(rejected) == 1
+    rec = rejected[0]
+    assert rec["kind"] == "bypass_rejected"
+    assert rec["attempted_value"] == "已签收"
+    assert rec["reason"]
+    # 核证同时给出当时的末 hop 与投影映射对照
+    assert rec["mapped_code"] == "ARRIVED_HUB"
+    assert rec["proj_value"] == "到站"
+    assert detail["attestation_id"] == rec["id"]
+
+    # 检查器与总览仍判同源，旁路拒绝不计入投影分叉
+    assert client.get("/api/status-check").json()["diverged"] == 0
+    overview = client.get("/api/overview").json()
+    assert overview["projection_diverged"] == 0
+    assert overview["bypass_rejections"] == 1
+
+
+def test_projection_follows_last_hop_with_derived_attestation(client):
+    """验收场景二：装载后投影随末 hop，且 derived 核证与末 hop/映射对照一致。"""
+    r = client.post(
+        "/api/waybills/WB-1002/hops",
+        json={
+            "id": "H-NEW2",
+            "event_ts": "2026-11-17T15:30:00Z",
+            "location_code": "SH-LOCAL",
+            "event_code": "DELIVERED",
+            "seq": 9,
+        },
+    )
+    assert r.status_code == 200
+    assert _wb(client, "WB-1002")["status_proj"] == "已签收"
+
+    proof = client.get("/api/waybills/WB-1002/status-proof").json()
+    assert proof["last_hop"]["id"] == "H-NEW2"
+    assert proof["mapped_code"] == "DELIVERED"
+    assert proof["proj_value"] == "已签收"
+    assert proof["同源"] is True
+
+    atts = client.get(
+        "/api/projection-attestations?waybill_id=WB-1002"
+    ).json()["items"]
+    derived = [a for a in atts if a["kind"] == "derived"]
+    latest = derived[0]
+    assert latest["bypass_rejected"] is False
+    assert latest["last_hop_id"] == "H-NEW2"
+    assert latest["mapped_code"] == "DELIVERED"
+    assert latest["proj_value"] == "已签收"
+    assert latest["timeline_digest"] == proof["timeline_digest"]
+    # 核证接口返回末 hop 与投影映射对照，且与证明接口同源
+    assert latest["proj_value"] == proof["proj_value"]
+    assert latest["last_hop_id"] == proof["last_hop"]["id"]
+
+
+def test_attestation_entity_is_read_only(client):
+    """核证实体只暴露只读接口：无任何改写入口，旁路写也不产生 derived 核证。"""
+    r = client.post("/api/waybills/WB-1002/status", json={"status_proj": "异常"})
+    assert r.status_code == 409
+    atts = client.get(
+        "/api/projection-attestations?waybill_id=WB-1002"
+    ).json()["items"]
+    assert all(a["kind"] in {"derived", "bypass_rejected"} for a in atts)
+    # 最新一条是拒绝记录，且没有伪造的 derived 投影写入
+    assert atts[0]["kind"] == "bypass_rejected"
+    assert atts[0]["bypass_rejected"] is True
+
+
+def test_force_refresh_flag_no_controls_projection_anymore(client):
+    """回归：投影刷新不再受请求里的开关控制，正式线变更即强制同事务重算。"""
+    before = _wb(client, "WB-1002")["status_proj"]
+    r = client.post(
+        "/api/waybills/WB-1002/hops",
+        json={
+            "id": "H-FORCE-CHECK",
+            "event_ts": "2026-11-17T16:00:00Z",
+            "location_code": "SH-LOCAL",
+            "event_code": "EXCEPTION",
+            "seq": 10,
+            # 故意不传 force_refresh_proj（即便传了也不应再有分支语义）
+        },
+    )
+    assert r.status_code == 200 and r.json()["written"] is True
+    assert _wb(client, "WB-1002")["status_proj"] != before
+    assert _wb(client, "WB-1002")["status_proj"] == "异常"
+    assert client.get("/api/status-check").json()["diverged"] == 0
+
+
+def test_timeline_and_projection_roll_back_together(client, monkeypatch):
+    """硬约束：投影写入失败时正式线 hop 一并回滚，不留「时间线已变投影未变」。"""
+    from app.services import projection as projection_svc
+
+    before_hops = client.get("/api/waybills/WB-1001/timeline").json()["hops"]
+    before_proj = _wb(client, "WB-1001")["status_proj"]
+
+    real_refresh = projection_svc.refresh
+
+    def boom(conn, waybill_id, *, write_proof=True):
+        if waybill_id == "WB-1001":
+            raise RuntimeError("模拟投影重算失败")
+        return real_refresh(conn, waybill_id, write_proof=write_proof)
+
+    monkeypatch.setattr(projection_svc, "refresh", boom)
+    r = client.post(
+        "/api/waybills/WB-1001/hops",
+        json={
+            "id": "H-ROLLBACK",
+            "event_ts": "2026-11-17T21:00:00Z",
+            "location_code": "X",
+            "event_code": "DELIVERED",
+        },
+    )
+    assert r.status_code == 500
+    monkeypatch.undo()
+
+    assert client.get("/api/waybills/WB-1001/timeline").json()["hops"] == before_hops
+    assert _wb(client, "WB-1001")["status_proj"] == before_proj
+    assert client.get("/api/status-check").json()["diverged"] == 0
+
+
+def test_rejection_attestation_persists_after_rollback(client):
+    """拒绝核证用独立连接落库：业务事务回滚不影响审计证据。"""
+    r = client.post("/api/waybills/WB-9999/status", json={"status": "已签收"})
+    assert r.status_code == 409
+    atts = client.get(
+        "/api/projection-attestations?waybill_id=WB-9999"
+    ).json()["items"]
+    assert len(atts) == 1 and atts[0]["bypass_rejected"] is True
+    assert atts[0]["attempted_value"] == "已签收"
+    # 不存在的运单没有业务写，也没有任何 waybills/hops 残留
+    assert all(w["id"] != "WB-9999" for w in client.get("/api/waybills").json())

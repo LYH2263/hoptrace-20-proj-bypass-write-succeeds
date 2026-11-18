@@ -5,15 +5,17 @@ import Quarantine from './pages/Quarantine.vue'
 import Sidecar from './pages/Sidecar.vue'
 import Proofs from './pages/Proofs.vue'
 import StatusProof from './pages/StatusProof.vue'
+import Attestations from './pages/Attestations.vue'
 
 export default createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', component: Board },
     { path: '/ingest', component: Ingest },
-    { path: '/quarantine', component: Quarantine },
     { path: '/sidecar', component: Sidecar },
+    { path: '/quarantine', component: Quarantine },
     { path: '/proofs', component: Proofs },
     { path: '/status', component: StatusProof },
+    { path: '/attestations', component: Attestations },
   ],
 })

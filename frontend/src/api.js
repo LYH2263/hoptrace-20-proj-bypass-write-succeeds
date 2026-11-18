@@ -45,4 +45,10 @@ export const api = {
   ingest: () => req('/api/ingest/run', { method: 'POST' }),
   proofs: (waybillId) =>
     req(waybillId ? `/api/status-proofs?waybill_id=${encodeURIComponent(waybillId)}` : '/api/status-proofs'),
+  attestations: (waybillId) =>
+    req(
+      waybillId
+        ? `/api/projection-attestations?waybill_id=${encodeURIComponent(waybillId)}`
+        : '/api/projection-attestations',
+    ),
 }

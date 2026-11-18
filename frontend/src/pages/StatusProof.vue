@@ -50,6 +50,28 @@ watch(focus, load)
         <dd><span class="tag" :class="detail['同源'] ? 'ok' : 'bad'">{{ detail['同源'] ? '是' : '否' }}</span></dd>
         <dt>来源</dt><dd>{{ detail.source }}</dd>
       </dl>
+      <h2 style="margin-top:16px">投影同源核证</h2>
+      <dl class="kv" v-if="detail.latest_attestation">
+        <dt>核证 id</dt><dd>{{ detail.latest_attestation.id }}</dd>
+        <dt>类型</dt>
+        <dd>
+          <span class="tag" :class="detail.latest_attestation.bypass_rejected ? 'bad' : 'ok'">
+            {{ detail.latest_attestation.bypass_rejected ? '旁路拒绝' : detail.latest_attestation.kind }}
+          </span>
+        </dd>
+        <dt>末 hop</dt><dd>{{ detail.latest_attestation.last_hop_id || '—' }}</dd>
+        <dt>映射码</dt><dd>{{ detail.latest_attestation.mapped_code || '—' }}</dd>
+        <dt>投影值</dt><dd>{{ detail.latest_attestation.proj_value || '—' }}</dd>
+        <dt>旁路尝试值</dt><dd>{{ detail.latest_attestation.attempted_value || '—' }}</dd>
+        <dt>时刻</dt><dd>{{ detail.latest_attestation.created_at }}</dd>
+      </dl>
+      <p v-else class="muted">暂无核证记录</p>
+      <p class="hint">
+        该运单累计旁路拒绝 <b>{{ detail.bypass_rejections }}</b> 次 ·
+        <router-link :to="`/attestations?wb=${detail.waybill_id}`" class="inline-link">
+          核证明细 →
+        </router-link>
+      </p>
     </section>
 
     <div class="stat-row" v-if="check">
@@ -64,7 +86,7 @@ watch(focus, load)
       <thead>
         <tr>
           <th>运单</th><th>投影值</th><th>末 hop</th><th>映射码</th>
-          <th>期望值</th><th>证明时刻</th><th>判定</th>
+          <th>期望值</th><th>最近核证</th><th>证明时刻</th><th>判定</th>
         </tr>
       </thead>
       <tbody>
@@ -78,13 +100,18 @@ watch(focus, load)
           <td>{{ r.last_hop_id || '—' }}</td>
           <td>{{ r.mapped_code || '—' }}</td>
           <td>{{ r.expected_status }}</td>
+          <td>
+            <span v-if="r.bypass_rejected" class="tag bad">旁路拒绝</span>
+            <span v-else-if="r.latest_attestation_kind" class="tag ok">{{ r.latest_attestation_kind }}</span>
+            <span v-else class="muted">—</span>
+          </td>
           <td>{{ r.proof_created_at || '—' }}</td>
           <td>
             <span v-if="r['同源']" class="tag ok">同源</span>
             <span v-else class="tag bad" :title="r.divergences.join('；')">分叉</span>
           </td>
         </tr>
-        <tr v-if="!check.items.length"><td colspan="7" class="muted">暂无运单</td></tr>
+        <tr v-if="!check.items.length"><td colspan="8" class="muted">暂无运单</td></tr>
       </tbody>
     </table>
   </div>

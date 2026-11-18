@@ -48,6 +48,22 @@ CREATE TABLE IF NOT EXISTS status_proofs (
   timeline_digest TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS projection_attestations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  waybill_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  bypass_rejected INTEGER NOT NULL DEFAULT 0,
+  last_hop_id TEXT,
+  mapped_code TEXT,
+  proj_value TEXT,
+  timeline_digest TEXT,
+  attempted_value TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projection_attestations_wb
+  ON projection_attestations(waybill_id, id);
 """
 
 
@@ -132,6 +148,75 @@ def _migrate(conn) -> None:
     if "timeline_digest" not in cols:
         conn.execute("ALTER TABLE status_proofs ADD COLUMN timeline_digest TEXT")
 
+    # 旧库补建投影同源核证表（基线所无的新实体）。
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "projection_attestations" not in tables:
+        conn.execute(
+            """
+            CREATE TABLE projection_attestations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              waybill_id TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              bypass_rejected INTEGER NOT NULL DEFAULT 0,
+              last_hop_id TEXT,
+              mapped_code TEXT,
+              proj_value TEXT,
+              timeline_digest TEXT,
+              attempted_value TEXT,
+              reason TEXT,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX idx_projection_attestations_wb "
+            "ON projection_attestations(waybill_id, id)"
+        )
+
+    # 表为空且已有运单 => 旧库升级，按当前正式时间线回填 derived 核证。
+    att_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM projection_attestations"
+    ).fetchone()["c"]
+    wb_count = conn.execute("SELECT COUNT(*) AS c FROM waybills").fetchone()["c"]
+    if att_count == 0 and wb_count > 0:
+        _backfill_attestations(conn)
+
+
+def _backfill_attestations(conn) -> None:
+    """旧库升级：为缺少 derived 核证的运单按当前正式时间线补一条核证。
+
+    只补审计证据，不触碰 status_proj（其值已由既有触发器约束为映射值）。
+    """
+    from app.modules import projection_attestation as attest
+    from app.modules import status_from_timeline as sft
+
+    rows = conn.execute("SELECT id FROM waybills ORDER BY id").fetchall()
+    for row in rows:
+        wid = row["id"]
+        exists = conn.execute(
+            "SELECT 1 FROM projection_attestations WHERE waybill_id=? AND kind='derived' LIMIT 1",
+            (wid,),
+        ).fetchone()
+        if exists:
+            continue
+        derived = sft.derive(conn, wid)
+        attest.insert(
+            conn,
+            {
+                "waybill_id": wid,
+                "kind": attest.KIND_DERIVED,
+                "bypass_rejected": False,
+                "last_hop_id": derived["last_hop"]["id"] if derived["last_hop"] else None,
+                "mapped_code": derived["mapped_code"],
+                "proj_value": derived["status"],
+                "timeline_digest": derived["timeline_digest"],
+                "attempted_value": None,
+                "reason": "backfill: 旧库升级补建同源核证",
+            },
+        )
+
 
 def init_db():
     conn = connect()
@@ -177,12 +262,6 @@ def _seed_fixtures(conn):
         )
     for wb in data.get("waybills", []):
         projection.refresh(conn, wb["id"])
-
-
-def _refresh_projections(conn):
-    """兼容旧调用点：全部运单重算投影（仍走同一投影服务）。"""
-    for row in conn.execute("SELECT id FROM waybills ORDER BY id").fetchall():
-        projection.refresh(conn, row["id"])
 
 
 def map_status(event_code: str) -> str:
